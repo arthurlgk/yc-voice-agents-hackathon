@@ -6,6 +6,7 @@ import {
 } from "@pipecat-ai/client-react";
 import { RTVIEvent } from "@pipecat-ai/client-js";
 import type { TransportState } from "@pipecat-ai/client-js";
+import { connectParams } from "../lib/pipecat";
 
 export type TranscriptRole = "user" | "bot";
 
@@ -175,8 +176,9 @@ export function usePipecatCall() {
     setTurns([]);
     setCallId(null);
     try {
-      // URL comes from the SmallWebRTC transport constructor (lib/pipecat.ts).
-      await client.connect();
+      // connectParams is undefined for local SmallWebRTC (URL is on the
+      // transport) and the PCC /start request for cloud Daily (lib/pipecat.ts).
+      await client.connect(connectParams);
     } catch (e) {
       setError(
         (e as { message?: string })?.message ??
