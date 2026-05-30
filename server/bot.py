@@ -286,6 +286,16 @@ async def run_bot(
             await insert_call_row(client, call_id, restaurant["id"], AGENT_ID)
         except Exception:
             logger.exception(f"Failed to insert call row (call_id={call_id})")
+        # Tell the web client which call_id this session is, so the browser can
+        # subscribe to the right Supabase order rows. Sent as an RTVI server
+        # message via the auto-wired RTVI processor (PipelineWorker exposes it as
+        # worker.rtvi). A Supabase/transport hiccup must never crash the call.
+        try:
+            await worker.rtvi.send_server_message(
+                {"type": "call_id", "call_id": call_id}
+            )
+        except Exception:
+            logger.exception(f"Failed to send call_id to client (call_id={call_id})")
         # Kick off the conversation. Greeting copy lives in restaurant/prompts/.
         context.add_message({"role": "user", "content": load_initial_user_message()})
         await worker.queue_frames([LLMRunFrame()])
