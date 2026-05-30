@@ -1,9 +1,10 @@
 agent_name = "restaurant-receptionist"
 secret_set = "restaurant-receptionist-secrets"
-agent_profile = "agent-1x"
+agent_profile = "agent-3x"
 
 [krisp_viva]
 	audio_filter = "tel"
 
 [scaling]
 	min_agents = 1
+	max_agents = 20
