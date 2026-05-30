@@ -120,9 +120,9 @@ def test_lo_mein_side_carries_three_dollar_delta():
     )
     by_group = {m["group_name"]: m for m in mods}
     assert by_group["Side Options"]["option_name"] == "Lo Mein"
-    assert by_group["Side Options"]["price_delta"] == "3.00"
+    assert by_group["Side Options"]["price_delta"] == 3.0
     assert by_group["Appetizer Choice"]["option_name"] == "Egg Roll"
-    assert by_group["Appetizer Choice"]["price_delta"] == "0.00"
+    assert by_group["Appetizer Choice"]["price_delta"] == 0.0
 
 
 def test_side_defaults_to_pork_fried_rice_when_unspecified():
@@ -131,7 +131,7 @@ def test_side_defaults_to_pork_fried_rice_when_unspecified():
     )
     side = next(m for m in mods if m["group_name"] == "Side Options")
     assert side["option_name"] == "Pork Fried Rice"
-    assert side["price_delta"] == "0.00"
+    assert side["price_delta"] == 0.0
 
 
 def test_missing_required_appetizer_raises():

@@ -75,16 +75,20 @@ place_order_schema = FunctionSchema(
                     },
                     "side": {
                         "type": "string",
+                        "enum": ["Pork Fried Rice", "Steamed Rice", "Lo Mein"],
                         "description": (
-                            "Combo items only: the side/rice choice, e.g. "
-                            "'Pork Fried Rice', 'Steamed Rice', or 'Lo Mein'."
+                            "Combo items only: the side/rice choice. Map what "
+                            "the caller says to one of these (e.g. 'white rice' "
+                            "-> 'Steamed Rice'). Lo Mein adds a $3.00 charge."
                         ),
                     },
                     "appetizer": {
                         "type": "string",
                         "description": (
-                            "Combo items only: the appetizer choice, e.g. "
-                            "'Egg Roll' or 'Crab Rangoons'."
+                            "Combo items only: the appetizer choice, one of "
+                            "Egg Roll, Spring Roll, Crab Rangoons, Fried Shrimp, "
+                            "Chicken Wing, Chicken Fingers, Can of Soda, Chicken "
+                            "Teriyaki, or Boneless Spare Ribs."
                         ),
                     },
                 },
@@ -177,7 +181,8 @@ def build_place_order_handler(
                         appetizer=it.get("appetizer"),
                     )
                 delta = sum(
-                    (Decimal(m["price_delta"]) for m in modifiers), Decimal("0")
+                    (Decimal(str(m["price_delta"])) for m in modifiers),
+                    Decimal("0"),
                 )
 
                 unit = Decimal(str(row["price"])) + delta
@@ -207,6 +212,19 @@ def build_place_order_handler(
                 )
         except OrderResolutionError as exc:
             await params.result_callback({"ok": False, "reason": str(exc)})
+            return
+        except Exception:
+            # Item/modifier resolution makes Supabase round-trips; a transient
+            # failure must still answer the tool call, or the LLM hangs waiting
+            # and the caller hears silence. Return a friendly retry message.
+            logger.exception("item resolution failed (call_id=%s)", call_id)
+            await params.result_callback(
+                {
+                    "ok": False,
+                    "reason": "Sorry, I had trouble pulling that up. "
+                    "Could you say that again?",
+                }
+            )
             return
 
         if not p_items:

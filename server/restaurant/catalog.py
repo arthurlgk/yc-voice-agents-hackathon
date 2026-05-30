@@ -178,15 +178,24 @@ def is_combo(category_name: str | None) -> bool:
 
 
 def _match_option(options: list[dict], spoken: str) -> dict | None:
-    """Map a caller's spoken choice to one modifier option, or None."""
+    """Map a caller's spoken choice to one modifier option, or None.
+
+    Tries, in order: an exact name/slug match; the spoken text as a substring of
+    an option name ("fried rice" -> "Pork Fried Rice"); then an option name
+    embedded in a longer spoken phrase ("the egg roll please"), guarded by a
+    length floor so short names like a 2-letter option don't over-match.
+    """
     s = spoken.strip().lower()
     s_slug = s.replace(" ", "-")
     for o in options:
         if o["name"].lower() == s or o.get("slug", "").lower() == s_slug:
             return o
     for o in options:
+        if s in o["name"].lower():
+            return o
+    for o in options:
         name = o["name"].lower()
-        if s in name or name in s:
+        if len(name) >= 4 and name in s:
             return o
     return None
 
@@ -230,16 +239,24 @@ async def resolve_combo_modifiers(
         .execute()
     ).data
 
+    # Fetch every group's options in one round-trip, then bucket in memory, so
+    # this stays a fixed two queries regardless of how many groups the combo has
+    # (place_order runs on the latency-sensitive end-of-order turn).
+    all_opts = (
+        await client.table("modifier_options")
+        .select("id,name,slug,price_delta,is_default,modifier_group_id,sort_order")
+        .in_("modifier_group_id", group_ids)
+        .order("sort_order")
+        .execute()
+    ).data
+    opts_by_group: dict[str, list[dict]] = {}
+    for o in all_opts:
+        opts_by_group.setdefault(o["modifier_group_id"], []).append(o)
+
     spoken_by_slug = {"side-options": side, "appetizer-choice": appetizer}
     chosen: list[dict] = []
     for g in groups:
-        opts = (
-            await client.table("modifier_options")
-            .select("id,name,slug,price_delta,is_default,sort_order")
-            .eq("modifier_group_id", g["id"])
-            .order("sort_order")
-            .execute()
-        ).data
+        opts = opts_by_group.get(g["id"], [])
         if not opts:
             continue
 
@@ -257,6 +274,11 @@ async def resolve_combo_modifiers(
             opt = next((o for o in opts if o.get("is_default")), None)
         if opt is None and g.get("is_required"):
             names = ", ".join(o["name"] for o in opts[:6])
+            logger.info(
+                "combo missing required modifier: group=%s variant=%s",
+                g["slug"],
+                variant_id,
+            )
             raise OrderResolutionError(
                 f"What would you like for the combo {g['name'].lower()}? "
                 f"Options are {names}."
@@ -270,7 +292,7 @@ async def resolve_combo_modifiers(
                 "modifier_option_id": opt["id"],
                 "group_name": g["name"],
                 "option_name": opt["name"],
-                "price_delta": money(Decimal(str(opt.get("price_delta") or 0))),
+                "price_delta": float(opt.get("price_delta") or 0),
             }
         )
     return chosen
