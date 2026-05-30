@@ -170,3 +170,129 @@ def _select_variant(rows: list[dict], name: str, size: str | None) -> dict:
     raise OrderResolutionError(
         f"{name} comes in {' or '.join(ordered)}. Which size would you like?"
     )
+
+
+def is_combo(category_name: str | None) -> bool:
+    """True for Lunch/Dinner Specials, the combos that carry side + appetizer."""
+    return (category_name or "") in COMBO_CATEGORIES
+
+
+def _match_option(options: list[dict], spoken: str) -> dict | None:
+    """Map a caller's spoken choice to one modifier option, or None.
+
+    Tries, in order: an exact name/slug match; the spoken text as a substring of
+    an option name ("fried rice" -> "Pork Fried Rice"); then an option name
+    embedded in a longer spoken phrase ("the egg roll please"), guarded by a
+    length floor so short names like a 2-letter option don't over-match.
+    """
+    s = spoken.strip().lower()
+    s_slug = s.replace(" ", "-")
+    for o in options:
+        if o["name"].lower() == s or o.get("slug", "").lower() == s_slug:
+            return o
+    for o in options:
+        if s in o["name"].lower():
+            return o
+    for o in options:
+        name = o["name"].lower()
+        if len(name) >= 4 and name in s:
+            return o
+    return None
+
+
+async def resolve_combo_modifiers(
+    client: AsyncClient,
+    item_id: str,
+    variant_id: str,
+    side: str | None = None,
+    appetizer: str | None = None,
+) -> list[dict]:
+    """Resolve a combo's required side + appetizer choices to modifier rows.
+
+    Walks ``item_modifier_groups`` -> ``modifier_groups`` -> ``modifier_options``
+    for this combo variant and maps the caller's spoken ``side`` / ``appetizer``
+    to real options. Returns dicts shaped like ``order_item_modifiers`` rows
+    (``modifier_group_id``, ``modifier_option_id``, ``group_name``,
+    ``option_name``, ``price_delta``) for the ``place_order`` payload.
+
+    Falls back to a group's default option when the caller did not specify one
+    (e.g. Pork Fried Rice for the side); raises ``OrderResolutionError`` when a
+    required group has no default and no choice, so the agent re-asks. Only
+    variant-scoped groups (Side Options, Appetizer Choice) are resolved; the
+    item-scoped Protein Choice is out of scope for the simplified agent.
+    """
+    links = (
+        await client.table("item_modifier_groups")
+        .select("modifier_group_id")
+        .eq("variant_id", variant_id)
+        .execute()
+    ).data
+    group_ids = [link["modifier_group_id"] for link in links]
+    if not group_ids:
+        return []
+
+    groups = (
+        await client.table("modifier_groups")
+        .select("id,name,slug,is_required,sort_order")
+        .in_("id", group_ids)
+        .order("sort_order")
+        .execute()
+    ).data
+
+    # Fetch every group's options in one round-trip, then bucket in memory, so
+    # this stays a fixed two queries regardless of how many groups the combo has
+    # (place_order runs on the latency-sensitive end-of-order turn).
+    all_opts = (
+        await client.table("modifier_options")
+        .select("id,name,slug,price_delta,is_default,modifier_group_id,sort_order")
+        .in_("modifier_group_id", group_ids)
+        .order("sort_order")
+        .execute()
+    ).data
+    opts_by_group: dict[str, list[dict]] = {}
+    for o in all_opts:
+        opts_by_group.setdefault(o["modifier_group_id"], []).append(o)
+
+    spoken_by_slug = {"side-options": side, "appetizer-choice": appetizer}
+    chosen: list[dict] = []
+    for g in groups:
+        opts = opts_by_group.get(g["id"], [])
+        if not opts:
+            continue
+
+        spoken = spoken_by_slug.get(g["slug"])
+        opt: dict | None = None
+        if spoken:
+            opt = _match_option(opts, spoken)
+            if opt is None:
+                names = ", ".join(o["name"] for o in opts[:6])
+                raise OrderResolutionError(
+                    f"For the combo {g['name'].lower()}, I have {names}. "
+                    "Which would you like?"
+                )
+        if opt is None:
+            opt = next((o for o in opts if o.get("is_default")), None)
+        if opt is None and g.get("is_required"):
+            names = ", ".join(o["name"] for o in opts[:6])
+            logger.info(
+                "combo missing required modifier: group=%s variant=%s",
+                g["slug"],
+                variant_id,
+            )
+            raise OrderResolutionError(
+                f"What would you like for the combo {g['name'].lower()}? "
+                f"Options are {names}."
+            )
+        if opt is None:
+            continue
+
+        chosen.append(
+            {
+                "modifier_group_id": g["id"],
+                "modifier_option_id": opt["id"],
+                "group_name": g["name"],
+                "option_name": opt["name"],
+                "price_delta": float(opt.get("price_delta") or 0),
+            }
+        )
+    return chosen

@@ -17,7 +17,14 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.services.llm_service import FunctionCallParams
 from supabase._async.client import AsyncClient
 
-from restaurant.catalog import OrderResolutionError, clean_name, money, resolve_item
+from restaurant.catalog import (
+    OrderResolutionError,
+    clean_name,
+    is_combo,
+    money,
+    resolve_combo_modifiers,
+    resolve_item,
+)
 
 logger = logging.getLogger("restaurant.orders")
 
@@ -34,7 +41,9 @@ place_order_schema = FunctionSchema(
         "read the full order back and the customer confirmed. If the customer "
         "later changes the order in the same call, call this again with the "
         "COMPLETE updated item list (not the change); it replaces the order. "
-        "Put rice choices, spice preferences, and any special requests in `notes`."
+        "For combo items (Lunch/Dinner Specials) pass the caller's rice and "
+        "appetizer on each item's `side` and `appetizer` fields. Put spice "
+        "preferences and any other special requests in `notes`."
     ),
     properties={
         "items": {
@@ -61,7 +70,25 @@ place_order_schema = FunctionSchema(
                         "enum": ["Small", "Large"],
                         "description": (
                             "Only for items that list both sm_price and "
-                            "lg_price. Omit for single-price items."
+                            "lg_price. Omit for single-price items and combos."
+                        ),
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["Pork Fried Rice", "Steamed Rice", "Lo Mein"],
+                        "description": (
+                            "Combo items only: the side/rice choice. Map what "
+                            "the caller says to one of these (e.g. 'white rice' "
+                            "-> 'Steamed Rice'). Lo Mein adds a $3.00 charge."
+                        ),
+                    },
+                    "appetizer": {
+                        "type": "string",
+                        "description": (
+                            "Combo items only: the appetizer choice, one of "
+                            "Egg Roll, Spring Roll, Crab Rangoons, Fried Shrimp, "
+                            "Chicken Wing, Chicken Fingers, Can of Soda, Chicken "
+                            "Teriyaki, or Boneless Spare Ribs."
                         ),
                     },
                 },
@@ -139,7 +166,26 @@ def build_place_order_handler(
                 qty = int(it.get("quantity") or 1)
                 size = it.get("size")
                 row = await resolve_item(client, restaurant_name, name, size)
-                unit = Decimal(str(row["price"]))
+
+                # Combos carry required side + appetizer modifiers; resolve them
+                # to real options and fold their price deltas (e.g. Lo Mein
+                # +$3.00) into the per-unit price. Totals are computed here and
+                # trusted by place_order_atomic, so include the delta in the line.
+                modifiers: list[dict] = []
+                if is_combo(row.get("category_name")):
+                    modifiers = await resolve_combo_modifiers(
+                        client,
+                        row["item_id"],
+                        row["variant_id"],
+                        side=it.get("side"),
+                        appetizer=it.get("appetizer"),
+                    )
+                delta = sum(
+                    (Decimal(str(m["price_delta"])) for m in modifiers),
+                    Decimal("0"),
+                )
+
+                unit = Decimal(str(row["price"])) + delta
                 line_total = unit * qty
                 subtotal += line_total
                 display_name = clean_name(row["item_name"])
@@ -153,7 +199,7 @@ def build_place_order_handler(
                         "line_total": money(line_total),
                         "display_name": display_name,
                         "variant_name": variant_name,
-                        "modifiers": [],
+                        "modifiers": modifiers,
                     }
                 )
                 confirmed.append(
@@ -161,10 +207,24 @@ def build_place_order_handler(
                         "name": display_name,
                         "size": None if variant_name == "Regular" else variant_name,
                         "quantity": qty,
+                        "modifiers": [m["option_name"] for m in modifiers],
                     }
                 )
         except OrderResolutionError as exc:
             await params.result_callback({"ok": False, "reason": str(exc)})
+            return
+        except Exception:
+            # Item/modifier resolution makes Supabase round-trips; a transient
+            # failure must still answer the tool call, or the LLM hangs waiting
+            # and the caller hears silence. Return a friendly retry message.
+            logger.exception("item resolution failed (call_id=%s)", call_id)
+            await params.result_callback(
+                {
+                    "ok": False,
+                    "reason": "Sorry, I had trouble pulling that up. "
+                    "Could you say that again?",
+                }
+            )
             return
 
         if not p_items:
