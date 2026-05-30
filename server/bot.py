@@ -4,27 +4,30 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Field & Flower — flower shop voice ordering bot (hackathon starter).
+"""Lin Garden — restaurant phone-ordering voice bot (YC Hackathon).
 
-A customer calls in and the bot helps them pick a bouquet and arrange delivery.
-All backend calls (catalog, customer lookup, order placement) are mocked so the
-starter runs with no external dependencies beyond the AI services.
+A customer calls in and the bot takes a food order for pickup or delivery. The
+live menu is read from Supabase at startup and embedded in the system prompt;
+the bot resolves spoken dish names to real menu rows and writes the order (and a
+call record) back to Supabase. The business logic lives in the ``restaurant/``
+package; this file only wires it into the Pipecat pipeline.
 
-Pipeline: Nemotron Speech Streaming STT → Nemotron-3-Super-120B LLM → Gradium TTS, with direct
-function tools registered on the LLM context.
+Pipeline: Nemotron Speech Streaming STT → Nemotron-3-Super-120B LLM → Gradium TTS,
+with a single ``place_order`` tool (plus ``end_call``) registered on the LLM.
 
 Run the bot using::
 
-    uv run bot-nemotron.py
+    uv run bot.py
 """
 
 import os
-import random
-from datetime import date
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import EndTaskFrame, FunctionCallResultProperties, LLMRunFrame
@@ -52,11 +55,21 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from mock_backend import BOUQUETS, KNOWN_CUSTOMERS
 from nemotron_llm import VLLMOpenAILLMService
 from nvidia_stt import NVidiaWebSocketSTTService
+from restaurant.calls import complete_call_row, insert_call_row
+from restaurant.menu import get_menu_markdown
+from restaurant.orders import build_place_order_handler, place_order_schema
+from restaurant.prompts import load_initial_user_message, load_receptionist_prompt
+from restaurant.supabase_client import get_client
 
 load_dotenv(override=True)
+
+# The restaurant whose menu we read and attach orders to (the seeded lin-garden
+# row on staging). The hackathon agent is distinguished by AGENT_ID and the
+# yc_hackathon- call_id prefix, not by a separate restaurant.
+RESTAURANT_SLUG = os.getenv("RESTAURANT_SLUG", "lin-garden")
+AGENT_ID = os.getenv("AGENT_ID", "yc_hackathon")
 
 
 async def get_call_info(call_sid: str) -> dict:
@@ -68,8 +81,8 @@ async def get_call_info(call_sid: str) -> dict:
     Returns:
         Dictionary containing call information including from_number, to_number, status, etc.
     """
-    account_sid = os.environ["TWILIO_ACCOUNT_SID"]
-    auth_token = os.environ["TWILIO_AUTH_TOKEN"]
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
 
     if not account_sid or not auth_token:
         logger.warning("Missing Twilio credentials, cannot fetch call info")
@@ -112,239 +125,68 @@ async def run_bot(
 
     Args:
         transport: The transport to use.
-        from_number: Caller's phone number (Twilio path only) for known-customer lookup.
+        from_number: Caller's phone number (Twilio path only), used only for logging.
         audio_in_sample_rate: Input audio sample rate in Hz. Defaults to 16000 (WebRTC).
         audio_out_sample_rate: Output audio sample rate in Hz. Defaults to 24000 (WebRTC).
     """
     logger.info("Starting bot")
 
-    # Per-call order state. Closed over by the tool functions below so each
-    # call gets its own isolated order.
-    order: dict = {"items": [], "delivery": None}
+    # Fetch the live menu and assemble the system prompt BEFORE building the LLM
+    # context, so the full menu is embedded in the system instruction. run_bot is
+    # async, so awaiting here is fine; nothing in the pipeline has started yet.
+    client = await get_client()
+    resp = await (
+        client.table("restaurants")
+        .select("id,name")
+        .eq("slug", RESTAURANT_SLUG)
+        .limit(1)
+        .execute()
+    )
+    restaurant = resp.data[0] if resp.data else None
+    if restaurant is None:
+        raise RuntimeError(
+            f"Restaurant slug {RESTAURANT_SLUG!r} not found in Supabase. "
+            "Check SUPABASE_URL / SUPABASE_SECRET_KEY and RESTAURANT_SLUG."
+        )
+    menu_markdown = await get_menu_markdown(client, restaurant["name"])
+    system_instruction = load_receptionist_prompt(menu_markdown)
+
+    # One id per session, prefixed so the dashboard and frontend can tell
+    # hackathon traffic apart from Lin Garden's own calls. Orders reuse this id.
+    call_id = f"yc_hackathon-{uuid4()}"
+    started_at = datetime.now(UTC)
+    logger.info(f"Session call_id={call_id} restaurant={restaurant['name']}")
 
     # --- Tools the LLM can call ---------------------------------------------
 
-    async def list_bouquets(
-        params: FunctionCallParams,
-        occasion: str | None = None,
-        specials_only: bool = False,
-    ) -> None:
-        """List bouquets available today. Optionally filter by occasion or by
-        what's currently on special.
-
-        Use this when the caller asks what's available, mentions a specific
-        occasion ("it's for my mom's birthday", "for Valentine's Day", "for a
-        funeral"), or asks about specials/deals. Sold-out bouquets are
-        automatically excluded from results.
-
-        Args:
-            occasion: Lowercase occasion to filter by. Common values:
-                "birthday", "anniversary", "valentine's day", "mother's day",
-                "sympathy", "wedding", "graduation", "thank you", "get well",
-                "new baby", "housewarming", "christmas", "easter", "just
-                because". Pass the canonical short form ("birthday", not "mom's
-                birthday"). Omit to return the full catalog.
-            specials_only: If True, only return bouquets currently on special.
-        """
-        results = []
-        for name, info in BOUQUETS.items():
-            if not info["in_stock"]:
-                continue
-            if specials_only and not info.get("on_special", False):
-                continue
-            if occasion is not None:
-                occ = occasion.strip().lower()
-                tags = [o.lower() for o in info.get("occasions", [])]
-                if not any(occ in tag or tag in occ for tag in tags):
-                    continue
-            results.append({"name": name, **info})
-
-        if not results and (occasion is not None or specials_only):
-            await params.result_callback(
-                {
-                    "bouquets": [],
-                    "note": (
-                        "No bouquets match those filters. Tell the caller you don't have "
-                        "anything specifically for that, and offer to browse the full "
-                        "catalog or try a different angle."
-                    ),
-                }
-            )
-            return
-
-        await params.result_callback({"bouquets": results})
-
-    async def check_availability(params: FunctionCallParams, bouquet_name: str) -> None:
-        """Check whether a specific bouquet is in stock today.
-
-        Args:
-            bouquet_name: The name of the bouquet to check, lowercase.
-        """
-        item = BOUQUETS.get(bouquet_name.lower())
-        if not item:
-            await params.result_callback(
-                {"available": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
-            )
-            return
-        if not item["in_stock"]:
-            await params.result_callback(
-                {"available": False, "reason": f"{bouquet_name} is sold out today."}
-            )
-            return
-        await params.result_callback({"available": True, "price": item["price"]})
-
-    async def add_to_order(
-        params: FunctionCallParams, bouquet_name: str, quantity: int = 1
-    ) -> None:
-        """Add a bouquet to the customer's order. Only call this after the
-        customer has confirmed they want this bouquet.
-
-        Args:
-            bouquet_name: The name of the bouquet to add, lowercase.
-            quantity: How many of this bouquet to add. Defaults to 1.
-        """
-        item = BOUQUETS.get(bouquet_name.lower())
-        if not item:
-            await params.result_callback(
-                {"ok": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
-            )
-            return
-        if not item["in_stock"]:
-            await params.result_callback(
-                {"ok": False, "reason": f"{bouquet_name} is sold out today."}
-            )
-            return
-        order["items"].append(
-            {"bouquet": bouquet_name.lower(), "quantity": quantity, "price": item["price"]}
-        )
-        await params.result_callback({"ok": True, "items": order["items"]})
-
-    async def get_order_summary(params: FunctionCallParams) -> None:
-        """Read back the current order: items, quantities, and running total."""
-        total = sum(line["price"] * line["quantity"] for line in order["items"])
-        await params.result_callback(
-            {"items": order["items"], "total": round(total, 2), "delivery": order["delivery"]}
-        )
-
-    async def set_delivery_details(
-        params: FunctionCallParams,
-        recipient_name: str,
-        address: str,
-        delivery_date: str,
-    ) -> None:
-        """Capture delivery details for the order.
-
-        Args:
-            recipient_name: Name of the person receiving the flowers.
-            address: Delivery street address.
-            delivery_date: Requested delivery date, in the customer's own words
-                (e.g. "Friday", "May 20th"). No parsing required.
-        """
-        order["delivery"] = {
-            "recipient_name": recipient_name,
-            "address": address,
-            "delivery_date": delivery_date,
-        }
-        await params.result_callback({"ok": True, "delivery": order["delivery"]})
-
-    async def place_order(params: FunctionCallParams) -> None:
-        """Finalize the order. Only call this after the customer has confirmed
-        the items AND delivery details."""
-        if not order["items"]:
-            await params.result_callback({"ok": False, "reason": "No items in the order yet."})
-            return
-        if not order["delivery"]:
-            await params.result_callback({"ok": False, "reason": "Missing delivery details."})
-            return
-        total = sum(line["price"] * line["quantity"] for line in order["items"])
-        confirmation = f"FLW-{random.randint(100000, 999999)}"
-        logger.info(f"Order placed: {confirmation} total=${total:.2f} order={order}")
-        await params.result_callback(
-            {
-                "ok": True,
-                "confirmation_number": confirmation,
-                "total": round(total, 2),
-                "eta": "within 2 business days",
-            }
-        )
+    handle_place_order = build_place_order_handler(
+        client, restaurant["id"], restaurant["name"], call_id
+    )
 
     async def end_call(params: FunctionCallParams) -> None:
-        """End the call. Only call this AFTER you have said goodbye to the
-        customer in the same turn. The pipeline will flush any queued speech
-        and then hang up."""
-        logger.info("end_call invoked — pushing EndTaskFrame upstream")
+        """End the call. Only call this AFTER saying goodbye in the same turn.
+
+        The pipeline flushes any queued speech and then hangs up.
+        """
+        logger.info("end_call invoked, pushing EndTaskFrame upstream")
         await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
         # run_llm=False prevents the LLM from generating a follow-up response
-        # after this function returns — the goodbye should already be in flight.
+        # after this returns — the goodbye should already be in flight.
         await params.result_callback(
             {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
         )
 
-    tool_functions = [
-        list_bouquets,
-        check_availability,
-        add_to_order,
-        get_order_summary,
-        set_delivery_details,
-        place_order,
-        end_call,
-    ]
-    tools = ToolsSchema(standard_tools=tool_functions)
-
-    # --- System instruction (varies based on caller ID) ---------------------
-
-    customer = KNOWN_CUSTOMERS.get(from_number or "")
-    if customer:
-        caller_context = (
-            f"This caller is a returning customer (caller ID matched). On file: "
-            f"name {customer['name']}, last order the {customer['last_order']} bouquet. "
-            'Greet them generically: "Welcome back to Field & Flower! How can I help '
-            'today?" Do not use their name or mention their last order in the greeting; '
-            "that comes across as surveilling. Once they say they want flowers, you "
-            "can offer their last order as a helpful shortcut, framed as record-keeping: "
-            f'"I have you down for the {customer["last_order"]} last time, want that '
-            'again or something different?" Always give them the alternative.'
-        )
-    else:
-        caller_context = (
-            "You're talking to a new customer. Introduce the shop briefly and ask how you can help."
-        )
-
-    system_instruction = (
-        "You are a friendly order-taker for Field & Flower, a neighborhood flower shop. "
-        "Help callers pick a bouquet and arrange delivery. Use the tools to look up "
-        "bouquets, check stock, add items, capture delivery details, and place the order. "
-        "Confirm the full order before calling place_order.\n\n"
-        "Talk like a real shop clerk on the phone — not a chatbot:\n"
-        "- Keep it to 1–2 short sentences per turn. Longer only when listing options or "
-        "doing the final order read-back.\n"
-        "- Ask ONE thing at a time. Don't ask for name, address, and date in one breath — "
-        "ask for the name, wait, then the next.\n"
-        '- Skip filler openers like "Absolutely!", "That sounds lovely!", "Perfect!", '
-        '"I\'d be happy to" — go straight to the point.\n'
-        "- Describe bouquets plainly. \"A dozen red roses with baby's breath, sixty-five "
-        'dollars." Not "a classic, romantic bouquet showing love and appreciation."\n'
-        "- When listing bouquets, ALWAYS lead with the bouquet's name. Format: "
-        '"<Name> — <description>, <price>." For example: "Spring Sunshine — yellow tulips '
-        'and daffodils, forty-five dollars." The name is how the caller refers back to it.\n'
-        "- When the caller mentions an occasion (birthday, Mother's Day, anniversary, "
-        "sympathy, etc.) or asks about specials/deals, pass those as filters to "
-        'list_bouquets (occasion="..." or specials_only=True) instead of reading the '
-        "full catalog. Don't list 15 bouquets when 3 are relevant.\n"
-        "- The catalog has many options — when listing, name at most 4 or 5 at a time. "
-        "If the caller doesn't bite, offer to share more.\n"
-        "- Don't restate what the customer just said back to them, except in the final "
-        "order confirmation.\n"
-        "- Use contractions. Fragments are fine.\n\n"
-        "Responses are spoken aloud. No bullet points, no emojis. Read prices in words "
-        '("forty-five dollars", not "$45.00").\n\n'
-        "When the order is placed and the customer has no more requests, or when they say "
-        'goodbye: say a short closing line (e.g. "Thanks, have a great day!") AND call '
-        "end_call in the same turn. Never call end_call without saying goodbye first.\n\n"
-        f"Today is {date.today().strftime('%A, %B %d, %Y')}. Use this when the caller "
-        'gives a relative delivery date like "this Friday" or "next Tuesday".\n\n'
-        f"Caller context: {caller_context}"
+    end_call_schema = FunctionSchema(
+        name="end_call",
+        description=(
+            "End the call. Only call this after you have said goodbye to the "
+            "customer in the same turn."
+        ),
+        properties={},
+        required=[],
     )
+
+    tools = ToolsSchema(standard_tools=[place_order_schema, end_call_schema])
 
     # Speech-to-Text service
     #
@@ -352,7 +194,7 @@ async def run_bot(
     # 16-bit PCM, 16 kHz, mono — matching the WebRTC input path. The URL can be
     # overridden via NVIDIA_ASR_URL.
     stt = NVidiaWebSocketSTTService(
-        url=os.environ["NVIDIA_ASR_URL"],
+        url=os.getenv("NVIDIA_ASR_URL", "ws://192.168.7.228:8081"),
         strip_interim_prefix=True,
     )
 
@@ -380,7 +222,7 @@ async def run_bot(
     enable_thinking = os.getenv("NEMOTRON_ENABLE_THINKING", "false").lower() == "true"
     llm = VLLMOpenAILLMService(
         api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),  # vLLM ignores unless --api-key set
-        base_url=os.environ["NEMOTRON_LLM_URL"],
+        base_url=os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1"),
         settings=VLLMOpenAILLMService.Settings(
             model=os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),
             system_instruction=system_instruction,
@@ -396,10 +238,10 @@ async def run_bot(
         ),
     )
 
-    # ToolsSchema describes the tools to the LLM; register_direct_function
-    # wires the actual handlers the LLM will invoke. Both are required.
-    for fn in tool_functions:
-        llm.register_direct_function(fn)
+    # ToolsSchema describes the tools to the LLM; register_function wires the
+    # actual handlers the LLM will invoke. Both are required.
+    llm.register_function("place_order", handle_place_order)
+    llm.register_function("end_call", end_call)
 
     context = LLMContext(tools=tools)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -434,20 +276,25 @@ async def run_bot(
     )
 
     @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
+    async def on_client_connected(transport, participant):
         logger.info("Client connected")
-        # Kick off the conversation
-        context.add_message(
-            {
-                "role": "user",
-                "content": "A customer just called. Greet them, 'This is Field & Flower, your local flower shop. How can I help you today?'",
-            }
-        )
+        # Record the call. A Supabase hiccup must never crash the call, so log
+        # and continue.
+        try:
+            await insert_call_row(client, call_id, restaurant["id"], AGENT_ID)
+        except Exception:
+            logger.exception(f"Failed to insert call row (call_id={call_id})")
+        # Kick off the conversation. Greeting copy lives in restaurant/prompts/.
+        context.add_message({"role": "user", "content": load_initial_user_message()})
         await worker.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
+    async def on_client_disconnected(transport, participant):
         logger.info("Client disconnected")
+        try:
+            await complete_call_row(client, call_id, started_at)
+        except Exception:
+            logger.exception(f"Failed to complete call row (call_id={call_id})")
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=False)
@@ -491,8 +338,7 @@ async def bot(runner_args: RunnerArguments):
             # Parse Twilio websocket and fetch call information
             _, call_data = await parse_telephony_websocket(runner_args.websocket)
 
-            # Fetch call information from Twilio REST API so we can personalize
-            # the bot for known customers (see KNOWN_CUSTOMERS).
+            # Fetch call information from Twilio REST API so we can log the caller.
             call_info = await get_call_info(call_data["call_id"])
             if call_info:
                 from_number = call_info.get("from_number")
@@ -501,8 +347,8 @@ async def bot(runner_args: RunnerArguments):
             serializer = TwilioFrameSerializer(
                 stream_sid=call_data["stream_id"],
                 call_sid=call_data["call_id"],
-                account_sid=os.environ["TWILIO_ACCOUNT_SID"],
-                auth_token=os.environ["TWILIO_AUTH_TOKEN"],
+                account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
+                auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
             )
 
             transport = FastAPIWebsocketTransport(
