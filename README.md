@@ -8,6 +8,8 @@ This is built to solve a real problem. The restaurant misses calls during the di
 
 **Note that when ordering the volume is low, please turn up the volume during the ordering part if possible**
 
+**Use 2x speed to have 1 minute video**
+
 https://www.loom.com/share/fd81c79c1560498ebc47209c693c14a2
 ## 3. How I used Cekura, Nemotron, and Pipecat
 
