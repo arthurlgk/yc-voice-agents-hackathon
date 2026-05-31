@@ -10,6 +10,8 @@ This is built to solve a real problem. The restaurant misses calls during the di
 
 **Use 2x speed to have 1 minute video**
 
+**I am uploading a version of this demo under the same root directory with better audio, but it may be after the deadline**
+
 https://www.loom.com/share/fd81c79c1560498ebc47209c693c14a2
 ## 3. How I used Cekura, Nemotron, and Pipecat
 
