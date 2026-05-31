@@ -13,6 +13,8 @@ This is built to solve a real problem. The restaurant misses calls during the di
 **I am uploading a version of this demo under the same root directory with better audio, but it may be after the deadline**
 
 https://www.loom.com/share/fd81c79c1560498ebc47209c693c14a2
+
+A link with better audio (same demo video) is here but after the deadline: https://www.loom.com/share/4716c78a97fc4465b42bec1628be5947
 ## 3. How I used Cekura, Nemotron, and Pipecat
 
 **Pipecat** is the orchestration. The pipeline runs Nemotron Speech Streaming STT into Nemotron-3-Super 120B into Gradium TTS. The same bot serves a browser over SmallWebRTC and a phone over Twilio without changing the conversation logic. I registered a `place_order` function tool with `llm.register_function`; inside the handler I resolve each spoken dish to a menu row, compute subtotal, 7% tax, and total, then call one Postgres RPC, `place_order_atomic`, on Supabase. The bot mints a call_id and pushes it to the browser over RTVI, and the React client opens a Supabase realtime channel filtered on that call_id so the order card redraws the moment voice writes the row. No polling.
